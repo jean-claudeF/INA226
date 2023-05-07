@@ -52,3 +52,7 @@ while True:
     P = '%2.3f' % p
     print(i, '\t',V, '\t', I, '\t',  P)
 ```
+
+TO DO:
+Add a comfortable function to set configuration options like averaging etc.
+
