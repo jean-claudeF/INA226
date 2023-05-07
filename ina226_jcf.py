@@ -1,10 +1,8 @@
-# https://github.com/elschopi/TI_INA226_micropython
-#  Christian Becker, modified by Jean-Claude Feltes
-
 # The MIT License (MIT)
 #
 # Copyright (c) 2017 Dean Miller for Adafruit Industries
 # Copyright (c) 2020 Christian Becker
+# Copyright (c) 2023 Jean-Claude Feltes
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -24,26 +22,21 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 # THE SOFTWARE.
 """
-`ina226`
+
 ====================================================
 micropython driver for the INA226 current sensor.
-* Author(s): Christian Becker
-modified by JCF
-Corrected shunt register resolution
-Added register read properties for raw values
+* Author(s): Christian Becker, Jean-Claude Feltes
+
 """
-# taken from https://github.com/robert-hh/INA219 , modified for the INA226 devices by
-# Christian Becker
-# June 2020
+
 
 from micropython import const
-# from adafruit_bus_device.i2c_device import I2CDevice
 
 __version__ = "0.0.0-auto.0"
 __repo__ = ""
 
 # Bits
-# pylint: disable=bad-whitespace
+
 _READ = const(0x01)
 
 # Config Register (R/W)
@@ -120,19 +113,42 @@ def _to_signed(num):
 
 class INA226:
     """Driver for the INA226 current sensor"""
-    def __init__(self, i2c_device, addr=0x40):
+    def __init__(self, i2c_device, addr=0x40, Rs = 0.002, voltfactor = 1):
         self.i2c_device = i2c_device
-
         self.i2c_addr = addr
         self.buf = bytearray(2)
-        # Multiplier in mA used to determine current from raw reading
-        self._current_lsb = 0
-        # Multiplier in W used to determine power from raw reading
-        self._power_lsb = 0
 
-        # Set chip to known config values to start
-        self._cal_value = 4096
-        self.set_calibration()
+        self._current_lsb = 0.001                # 1mA resolution for the current is OK for most applications
+        self._power_lsb = 25 * self._current_lsb        # Datasheet -> 25 is a fixed factor
+
+        self.SR_V_LSB = 2.5E-6                   # Shunt register: voltage LSB  2.5uV
+        self.SR_I_LSB = self.SR_V_LSB / Rs       # Shunt register: current LSB corresponding to SR_V_LSB
+        
+        self.BVR_LSB = 0.00125                   # Bus voltage register LSB = 1.25mV
+        
+        self._cal_value = 2560                   # CAL for Rs = 2mOhm
+        
+        self.voltfactor = voltfactor             # multiplier when using a divider for the bus voltage e.g. 2 for 10k, 10k
+    #------------------------------------------------------------------
+    # Function that uses only bus and shunt voltage registers
+    # Should be easier to use and more precise, but maybe a bit slower
+    # CAL, Current and Power registers are not used
+    def get_VIP(self):
+        V = self.bus_voltage * self.voltfactor
+        I = self.shunt_register * self.SR_I_LSB
+        P = V * I
+        return V, I, P
+        
+    
+    # Function that uses CAL, Current and Power registers
+    # CAL must be set!
+    def get_VIP_TI(self):
+        V = self.bus_voltage * self.voltfactor
+        I = self.current 
+        P = self.power * self.voltfactor
+        return V, I, P
+        
+    #------------------------------------------------------------------
 
     def _write_register(self, reg, value):
         self.buf[0] = (value >> 8) & 0xFF
@@ -145,45 +161,6 @@ class INA226:
         return value
 
     @property
-    def shunt_voltage(self):
-        """The shunt voltage (between V+ and V-) in Volts (so +-.327V)"""    # no, +-80mV!
-        value = _to_signed(self._read_register(_REG_SHUNTVOLTAGE))
-        # The least signficant bit is 10uV which is 0.00001 volts
-        # NO!! It is 2.5uV
-        # return value * 0.00001
-        return value * 0.0000025
-
-    @property
-    def bus_voltage(self):
-        """The bus voltage (between V- and GND) in Volts"""
-        raw_voltage = self._read_register(_REG_BUSVOLTAGE)
-        # voltage in millVolt is register content multiplied with 1.25mV/bit
-        voltage_mv = raw_voltage * 1.25
-        # Return Volts instead of milliVolts
-        return voltage_mv * 0.001
-
-    @property
-    def current(self):
-        """The current through the shunt resistor in milliamps."""
-        # Sometimes a sharp load will reset the INA219, which will
-        # reset the cal register, meaning CURRENT and POWER will
-        # not be available ... athis by always setting a cal
-        # value even if it's an unfortunate extra step
-        self._write_register(_REG_CALIBRATION, self._cal_value)
-
-        # Now we can safely read the CURRENT register!
-        raw_current = _to_signed(self._read_register(_REG_CURRENT))
-        return raw_current * self._current_lsb
-    
-    @property
-    def power(self):
-        # INA226 stores the calculated power in this register        
-        raw_power = _to_signed(self._read_register(_REG_POWER))
-        # Calculated power is derived by multiplying raw power value with the power LSB
-        return raw_power * self._power_lsb
-    
-    
-    @property
     def shunt_register(self):
         '''Raw signed shunt register value'''
         value = _to_signed(self._read_register(_REG_SHUNTVOLTAGE))
@@ -192,8 +169,7 @@ class INA226:
     @property
     def busvoltage_register(self):
         """Raw bus voltage """
-        raw_voltage = self._read_register(_REG_BUSVOLTAGE)
-        return  raw_voltage
+        return self._read_register(_REG_BUSVOLTAGE)
 
     @property
     def current_register(self):
@@ -207,37 +183,39 @@ class INA226:
         # Now we can safely read the CURRENT register!
         raw_current = _to_signed(self._read_register(_REG_CURRENT))
         return raw_current 
-    
+
     @property
     def power_register(self):
         """Raw power register value"""
+        return _to_signed(self._read_register(_REG_POWER))
+
+    @property
+    def shunt_voltage(self):
+        """Shunt voltage in Volts (so +-80mV)"""    
+        return self.shunt_register * self.SR_V_LSB
+        
+    @property
+    def bus_voltage(self):
+        """Bus voltage in Volts"""
+        raw_voltage = self._read_register(_REG_BUSVOLTAGE)
+        return raw_voltage * self.BVR_LSB
+    
+    @property
+    def current(self):
+        """Current through the shunt resistor in Ampères"""
+        return self.current_register * self._current_lsb
+    
+    @property
+    def power(self):
         raw_power = _to_signed(self._read_register(_REG_POWER))
-        return raw_power 
-#-------------------------------------------------------------------------    
-# Example calculations for calibration register value, current LSB and power LSB
-# 1. Assuming a 100milliOhm resistor as shunt
-# RSHUNT = 0.1
-#
-# 2. Determine current_lsb
-# Assuming a maximum expected current of 3.6A
-# current_lsb = MaxExpected_I / (2^15)
-# current_lsb = 3.6A / (2^15)
-# current_lsb = 0.0001098632813
-# -> Rounding to "nicer" numbers:
-# current_lsb = 0.0001
-#
-# 3. Setting the power LSB
-# power_lsb = 25 * current_lsb
-# power_lsb = 25 * 0.0001
-# power_lsb = 0.0025
-#
-# 4. Determine calibration register value
-# cal_value = 0.00512 / (RSHUNT * current_lsb)
-# cal_value = 0.00512 / (0.1 * 0.0001)
-# cal_value = 512
-#
-#
-    def set_calibration(self):  # pylint: disable=invalid-name
+        return raw_power * self._power_lsb
+    
+    
+    
+    
+   
+
+    def set_default_calibration(self):  
         """Configures to INA226 to be able to measure up to 36V and 2A
             of current. Counter overflow occurs at 3.2A.
            ..note :: These calculations assume a 0.1 shunt ohm resistor"""
@@ -253,6 +231,11 @@ class INA226:
                   _CONFIG_MODE_SANDBVOLT_CONTINUOUS)
         
         self._write_register(_REG_CONFIG, config)
+    
+    def set_current_lsb(self, value):
+        self._current_lsb = value
+        self._power_lsb = value *25
+        
     
     def set_calibration_custom(self, calValue=512, config=0x4127):
     # Set the configuration register externally by using the hex value for the config register
